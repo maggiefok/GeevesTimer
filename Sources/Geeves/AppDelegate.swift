@@ -10,7 +10,16 @@ final class GeevesPanel: NSPanel {
 
 /// Lets the very first click on the play/stop button work, even when another app is in front.
 final class PanelHostingView<Content: View>: NSHostingView<Content> {
+    /// Called whenever the SwiftUI content changes size (pill ↔ card, note growing, toast appearing).
+    var onContentResize: (() -> Void)?
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func invalidateIntrinsicContentSize() {
+        super.invalidateIntrinsicContentSize()
+        // Wait for SwiftUI to finish the update before measuring.
+        DispatchQueue.main.async { [weak self] in self?.onContentResize?() }
+    }
 }
 
 final class ClosureMenuItem: NSMenuItem {
@@ -37,6 +46,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// The panel's top-right corner. The pill and card grow down and to the left from here.
     private var anchor = NSPoint.zero
+    /// Last size SwiftUI reported, and the frame we last set ourselves (so our own resizes aren't mistaken for drags).
+    private var contentSize = CGSize.zero
+    private var programmaticFrame = NSRect.zero
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installEditMenu()
@@ -45,6 +57,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state = AppState(sync: sync)
         state.onWantsFocus = { [weak self] in self?.focusPanel() }
         state.onFinished = { [weak self] in self?.releaseFocus() }
+
+        // Work out the top-right anchor before any content exists, since SwiftUI reports its size immediately.
+        placeAnchor()
 
         panel = GeevesPanel(
             contentRect: NSRect(x: 0, y: 0, width: 220, height: 70),
@@ -63,19 +78,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let root = RootView(
             state: state,
             sync: sync,
-            menu: { [weak self] in self?.buildMenu() ?? NSMenu() },
-            onSize: { [weak self] size in self?.resize(to: size) }
+            menu: { [weak self] in self?.buildMenu() ?? NSMenu() }
         )
         let host = PanelHostingView(rootView: root)
-        host.sizingOptions = [] // we size the panel ourselves, anchored top-right
+        // We size the panel ourselves, anchored top-right, from the hosting view's own measurement.
+        // (A GeometryReader preference reported 0×0 here, which left the stop card squashed into a tiny panel.)
+        host.sizingOptions = [.intrinsicContentSize]
+        host.onContentResize = { [weak self, weak host] in
+            guard let self, let host else { return }
+            self.resize(to: host.fittingSize)
+        }
         panel.contentView = host
 
-        placeAnchor()
         resize(to: host.fittingSize)
+        if contentSize.width <= 1 {
+            // Nothing measurable yet: park a default-sized panel at the anchor so it never sits at the bottom-left.
+            resize(to: CGSize(width: 220, height: 70))
+        }
         panel.orderFrontRegardless()
 
+        // Remember where you drag it. Our own resizes keep the same top-right corner, so they're ignored.
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: panel, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.rememberAnchor() }
+            Task { @MainActor in
+                guard let self, self.panel.frame != self.programmaticFrame else { return }
+                self.rememberAnchor()
+            }
         }
 
         installKeys()
@@ -108,8 +135,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func resize(to size: CGSize) {
         guard size.width > 1, size.height > 1 else { return }
-        let frame = NSRect(x: anchor.x - size.width, y: anchor.y - size.height, width: size.width, height: size.height)
-        if panel.frame != frame { panel.setFrame(frame, display: true) }
+        contentSize = size
+        guard let panel else { return }
+        var frame = NSRect(x: anchor.x - size.width, y: anchor.y - size.height, width: size.width, height: size.height)
+
+        // Keep the whole pill or card on screen, e.g. when it has been dragged near a left or bottom edge.
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: anchor.x - 1, y: anchor.y - 1)) })
+            ?? NSScreen.main ?? NSScreen.screens[0]
+        let visible = screen.visibleFrame
+        frame.origin.x = min(max(frame.origin.x, visible.minX), visible.maxX - frame.width)
+        frame.origin.y = min(max(frame.origin.y, visible.minY), visible.maxY - frame.height)
+
+        if panel.frame != frame {
+            programmaticFrame = frame
+            panel.setFrame(frame, display: true)
+        }
     }
 
     // MARK: Focus
@@ -140,7 +180,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handle(_ e: NSEvent) -> Bool {
-        let shift = e.modifierFlags.contains(.shift)
         let cmd = e.modifierFlags.contains(.command)
         let option = e.modifierFlags.contains(.option)
         let isReturn = e.keyCode == 36 || e.keyCode == 76
@@ -148,20 +187,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch state.screen {
         case .search:
             if e.keyCode == 53 { state.discard(); return true }
-            if isReturn { state.activateSelected(addNote: false); return true }
-            if e.keyCode == 48 { if !shift { state.activateSelected(addNote: true) }; return true }
+            // In the note: option-return adds a new line, plain return moves on to the clients.
+            // In the search: return saves with the selected client.
+            if isReturn && state.editingNote {
+                if option { return false }
+                state.finishNote()
+                return true
+            }
+            if isReturn { state.activateSelected(); return true }
+            // Tab (or shift-tab) hops between the search field and the note field.
+            if e.keyCode == 48 { state.editingNote.toggle(); return true }
             if e.keyCode == 125 { state.move(1); return true }
             if e.keyCode == 126 { state.move(-1); return true }
             if cmd, let ch = e.charactersIgnoringModifiers, let n = Int(ch), (1...9).contains(n) {
                 state.pick(index: n - 1)
                 return true
             }
-            return false
-
-        case .note:
-            if e.keyCode == 53 { state.discard(); return true }
-            if isReturn && !option { state.saveNote(); return true } // option-return for a new line
-            if e.keyCode == 48 && shift { state.backToSearch(); return true }
             return false
 
         case .newClient:

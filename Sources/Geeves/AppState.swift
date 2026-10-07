@@ -21,7 +21,7 @@ struct TimeEntry: Codable, Identifiable, Equatable {
 }
 
 enum Screen {
-    case idle, running, search, newClient, note
+    case idle, running, search, newClient
 }
 
 enum SearchRow: Identifiable, Equatable {
@@ -49,8 +49,11 @@ final class AppState: ObservableObject {
     @Published var entry: TimeEntry?
     @Published var query = "" { didSet { selected = 0 } }
     @Published var selected = 0
-    @Published var chosen: ClientOption?
     @Published var note = ""
+    /// True while the note field on the stop card has the keyboard (tab switches between it and search).
+    @Published var editingNote = false
+    /// Set when you try to pick a client before writing a note, so the note field can flag itself.
+    @Published var noteNeeded = false
     @Published var newName = ""
     @Published var newType = ""
     @Published var clients: [ClientOption] = []
@@ -128,8 +131,10 @@ final class AppState: ObservableObject {
         saveOpenEntry()
         query = ""
         selected = 0
-        chosen = nil
         note = ""
+        // The note comes first, so the card opens with it focused.
+        editingNote = true
+        noteNeeded = false
         screen = .search
         onWantsFocus()
     }
@@ -171,29 +176,45 @@ final class AppState: ObservableObject {
         selected = (selected + delta + n) % n
     }
 
-    func activateSelected(addNote: Bool) {
+    func activateSelected() {
         let rows = results
         guard rows.indices.contains(selected) else { return }
-        pick(rows[selected], addNote: addNote)
+        pick(rows[selected])
     }
 
     func pick(index: Int) {
         let rows = results
         guard rows.indices.contains(index) else { return }
         selected = index
-        pick(rows[index], addNote: false)
+        pick(rows[index])
     }
 
-    func pick(_ row: SearchRow, addNote: Bool) {
+    var hasNote: Bool {
+        !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Returns false (and sends you back to the note field) if the note is still empty.
+    @discardableResult
+    func requireNote() -> Bool {
+        guard hasNote else {
+            noteNeeded = true
+            editingNote = true
+            return false
+        }
+        noteNeeded = false
+        return true
+    }
+
+    /// Return in the note field: move on to choosing a client once there's a note.
+    func finishNote() {
+        if requireNote() { editingNote = false }
+    }
+
+    func pick(_ row: SearchRow) {
+        guard requireNote() else { return }
         switch row {
         case .client(let o):
-            if addNote {
-                chosen = o
-                screen = .note
-                onWantsFocus()
-            } else {
-                commit(o)
-            }
+            commit(o)
         case .newClient(let name):
             newName = name
             newType = workTypes.first ?? ""
@@ -203,13 +224,8 @@ final class AppState: ObservableObject {
     }
 
     func backToSearch() {
-        chosen = nil
         screen = .search
         onWantsFocus()
-    }
-
-    func saveNote() {
-        if let o = chosen { commit(o) }
     }
 
     func createClient() {
@@ -227,7 +243,7 @@ final class AppState: ObservableObject {
     // MARK: Save / discard
 
     func commit(_ o: ClientOption) {
-        guard var e = entry else { return }
+        guard var e = entry, requireNote() else { return }
         e.client = o.client
         e.workType = o.workType
         e.note = note.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -236,8 +252,8 @@ final class AppState: ObservableObject {
 
         entry = nil
         saveOpenEntry()
-        chosen = nil
         note = ""
+        editingNote = false
         screen = restingScreen
         onFinished()
 
@@ -249,6 +265,7 @@ final class AppState: ObservableObject {
             if self.sync.cancel(itemID) {
                 self.openEntry(saved)
                 self.note = saved.note
+                self.editingNote = false
             } else {
                 self.showToast("Already sent to Geeves. Fix it in the Time Log.", undo: nil)
             }

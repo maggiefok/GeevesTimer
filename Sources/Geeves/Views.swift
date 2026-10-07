@@ -22,18 +22,12 @@ enum Fmt {
     }
 }
 
-struct SizeKey: PreferenceKey {
-    static var defaultValue: CGSize = .zero
-    static func reduce(value: inout CGSize, nextValue: () -> CGSize) { value = nextValue() }
-}
-
 // MARK: - Root
 
 struct RootView: View {
     @ObservedObject var state: AppState
     @ObservedObject var sync: SyncQueue
     let menu: () -> NSMenu
-    let onSize: (CGSize) -> Void
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 8) {
@@ -44,8 +38,6 @@ struct RootView: View {
                 Card(state: state) { SearchView(state: state, connected: sync.api != nil) }
             case .newClient:
                 Card(state: state) { NewClientView(state: state) }
-            case .note:
-                Card(state: state) { NoteView(state: state) }
             }
             if let t = state.toast {
                 ToastView(toast: t) { state.performUndo() }
@@ -54,8 +46,6 @@ struct RootView: View {
         .padding(14) // room for the shadow
         .fixedSize()
         .environment(\.colorScheme, .light)
-        .background(GeometryReader { g in Color.clear.preference(key: SizeKey.self, value: g.size) })
-        .onPreferenceChange(SizeKey.self, perform: onSize)
     }
 }
 
@@ -102,14 +92,18 @@ struct PillView: View {
         .padding(.leading, running ? 14 : 18)
         .padding(.trailing, 6)
         .padding(.vertical, 6)
-        .background(Capsule().fill(Color.white))
+        // The whole pill (apart from the play/stop button) drags the timer around.
+        .background(ZStack {
+            Capsule().fill(Color.white)
+            DragArea(menu: menu).clipShape(Capsule())
+        })
         .overlay(Capsule().stroke(running ? Theme.accent : Theme.ink, lineWidth: running ? 2 : 1.5))
         .shadow(color: .black.opacity(0.15), radius: 8, y: 3)
     }
 }
 
 struct DragArea: NSViewRepresentable {
-    let menu: () -> NSMenu
+    var menu: (() -> NSMenu)? = nil
 
     final class DragView: NSView {
         var menuProvider: (() -> NSMenu)?
@@ -139,12 +133,17 @@ struct Card<Content: View>: View {
         VStack(spacing: 0) {
             if let e = state.entry {
                 EntryHeader(entry: e, billed: state.billedHours(e))
+                    .overlay(DragArea()) // drag the card by its header
                 Divider()
             }
             content
         }
         .frame(width: 340)
-        .background(Color.white)
+        // Empty space in the card drags it too.
+        .background(ZStack {
+            Color.white
+            DragArea()
+        })
         .clipShape(RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.ink, lineWidth: 1.5))
         .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
@@ -200,17 +199,35 @@ struct Footer: View {
 struct SearchView: View {
     @ObservedObject var state: AppState
     let connected: Bool
-    @FocusState private var focused: Bool
+
+    private enum Field { case search, note }
+    @FocusState private var focus: Field?
 
     var body: some View {
         VStack(spacing: 0) {
+            // Required note, written before picking a client. Goes in the Task column of the Time Log.
+            let flagNote = state.noteNeeded && !state.hasNote
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Image(systemName: "square.and.pencil").foregroundColor(flagNote ? .red : Theme.mid)
+                TextField(flagNote ? "Add a note before choosing a client" : "What did you work on?",
+                          text: $state.note, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...4)
+                    .font(.system(size: 14))
+                    .foregroundColor(Theme.ink)
+                    .focused($focus, equals: .note)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            Divider()
+
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass").foregroundColor(Theme.mid)
                 TextField("Find a client or project", text: $state.query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 15))
                     .foregroundColor(Theme.ink)
-                    .focused($focused)
+                    .focused($focus, equals: .search)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
@@ -230,7 +247,7 @@ struct SearchView: View {
                         .contentShape(Rectangle())
                         .onTapGesture {
                             state.selected = i
-                            state.pick(row, addNote: false)
+                            state.pick(row)
                         }
                 }
             }
@@ -244,9 +261,14 @@ struct SearchView: View {
                     .padding(.horizontal, 16)
                     .padding(.bottom, 8)
             }
-            Footer(left: "tab · add a note", right: "esc · discard")
+            Footer(left: state.editingNote ? "return · choose client" : "tab · edit note", right: "esc · discard")
         }
-        .onAppear { DispatchQueue.main.async { focused = true } }
+        .onAppear { DispatchQueue.main.async { focus = state.editingNote ? .note : .search } }
+        // Keep the keyboard (tab key) and mouse clicks in step about which field is active.
+        .onChange(of: state.editingNote) { editing in focus = editing ? .note : .search }
+        .onChange(of: focus) { f in
+            if let f, (f == .note) != state.editingNote { state.editingNote = f == .note }
+        }
     }
 }
 
@@ -373,47 +395,6 @@ struct FlowLayout: Layout {
             x += size.width + spacing
             rowHeight = max(rowHeight, size.height)
         }
-    }
-}
-
-// MARK: - Note
-
-struct NoteView: View {
-    @ObservedObject var state: AppState
-    @FocusState private var focused: Bool
-
-    var body: some View {
-        VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Text(state.chosen?.label ?? "")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 12)
-                        .frame(height: 28)
-                        .background(Capsule().fill(Theme.ink))
-                    Spacer()
-                    Text("shift-tab · change")
-                        .font(.system(size: 12))
-                        .foregroundColor(Theme.mid)
-                }
-                TextField("what did you work on?", text: $state.note, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(3...6)
-                    .font(.system(size: 14))
-                    .foregroundColor(Theme.ink)
-                    .padding(10)
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.ink, lineWidth: 1.5))
-                    .focused($focused)
-                Text("Goes in the Task column of your Time Log, which becomes the invoice line.")
-                    .font(.system(size: 11))
-                    .foregroundColor(Theme.mid)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(16)
-            Footer(left: "return · save", right: "esc · discard")
-        }
-        .onAppear { DispatchQueue.main.async { focused = true } }
     }
 }
 
